@@ -16,9 +16,17 @@ num_proc = 8
 # it is better than 1 usually though
 num_proc_load_dataset = num_proc
 
+# Write the large binary files to local storage when NANOGPT_DATA_DIR is set.
+# This avoids slow mmap writeback when the repository is on a network filesystem.
+output_dir = os.environ.get("NANOGPT_DATA_DIR", os.path.dirname(__file__))
+write_batches = int(os.environ.get("NANOGPT_WRITE_BATCHES", 128))
+
 enc = tiktoken.get_encoding("gpt2")
 
 if __name__ == '__main__':
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"writing binary datasets to {output_dir}")
+
     # takes 54GB in huggingface .cache dir, about 8M documents (8,013,769)
     dataset = load_dataset("openwebtext", num_proc=num_proc_load_dataset)
 
@@ -58,10 +66,10 @@ if __name__ == '__main__':
     # concatenate all the ids in each dataset into one large file we can use for training
     for split, dset in tokenized.items():
         arr_len = np.sum(dset['len'], dtype=np.uint64)
-        filename = os.path.join(os.path.dirname(__file__), f'{split}.bin')
+        filename = os.path.join(output_dir, f'{split}.bin')
         dtype = np.uint16 # (can do since enc.max_token_value == 50256 is < 2**16)
         arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
-        total_batches = 1024
+        total_batches = min(write_batches, len(dset))
 
         idx = 0
         for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
@@ -72,6 +80,7 @@ if __name__ == '__main__':
             arr[idx : idx + len(arr_batch)] = arr_batch
             idx += len(arr_batch)
         arr.flush()
+        del arr
 
     # train.bin is ~17GB, val.bin ~8.5MB
     # train has ~9B tokens (9,035,582,198)

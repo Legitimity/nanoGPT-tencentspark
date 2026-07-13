@@ -37,7 +37,8 @@ eval_interval = 2000
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
+always_save_checkpoint = True # if True, save a checkpoint every save_interval iterations
+save_interval = 500 # save a checkpoint every N iterations (only when always_save_checkpoint is True)
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
@@ -259,36 +260,38 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    # evaluate the loss on train/val sets and write checkpoints
+    # evaluate the loss on train/val sets
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        if losses['val'] < best_val_loss:
+            best_val_loss = losses['val']
         if wandb_log:
             wandb.log({
-                "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+            }, step=iter_num)
+
+    # save checkpoint periodically (independent of eval)
+    if always_save_checkpoint and iter_num > 0 and iter_num % save_interval == 0 and master_process:
+        checkpoint = {
+            'model': raw_model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'model_args': model_args,
+            'iter_num': iter_num,
+            'best_val_loss': best_val_loss,
+            'config': config,
+        }
+        print(f"saving checkpoint to {out_dir}")
+        torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
+    loss_accum = torch.zeros((), device=device) if master_process else None
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
@@ -299,6 +302,8 @@ while True:
         with ctx:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+        if master_process:
+            loss_accum += loss.detach()
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
@@ -317,14 +322,18 @@ while True:
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
+    # Convert the average accumulated loss to a CPU value for logging.
+    lossf = loss_accum.item() if master_process else None
     if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+    if wandb_log and master_process:
+        wandb.log({
+            "train/batch_loss": lossf,
+            "lr": lr,
+        }, step=iter_num)
     iter_num += 1
     local_iter_num += 1
 

@@ -10,3 +10,9 @@ __pycache__/
 input.txt
 env/
 venv/
+# Local training artifacts
+data/openwebtext/*.bin
+out/
+out-*/
+wandb/
+*.pt
