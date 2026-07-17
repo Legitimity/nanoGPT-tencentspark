@@ -261,7 +261,7 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets
-    if iter_num % eval_interval == 0 and master_process:
+    if (eval_only or iter_num % eval_interval == 0) and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if losses['val'] < best_val_loss:
@@ -286,7 +286,7 @@ while True:
         }
         print(f"saving checkpoint to {out_dir}")
         torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-    if iter_num == 0 and eval_only:
+    if eval_only:
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
