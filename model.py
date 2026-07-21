@@ -49,7 +49,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, collect_head_stats=False):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -69,10 +69,21 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        head_stats = None
+        if collect_head_stats:
+            y_float = y.detach().float()
+            token_rms = y_float.square().mean(dim=-1).sqrt()
+            head_stats = torch.stack([
+                token_rms.mean(dim=(0, 2)),
+                token_rms.amax(dim=(0, 2)),
+                y_float.abs().amax(dim=(0, 2, 3)),
+            ], dim=-1)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
+        if collect_head_stats:
+            return y, head_stats
         return y
 
 class MLP(nn.Module):
@@ -100,9 +111,15 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, collect_head_stats=False):
+        if collect_head_stats:
+            attn_out, head_stats = self.attn(self.ln_1(x), collect_head_stats=True)
+        else:
+            attn_out = self.attn(self.ln_1(x))
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
+        if collect_head_stats:
+            return x, head_stats
         return x
 
 @dataclass
@@ -167,7 +184,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, collect_head_stats=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -177,8 +194,13 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        all_head_stats = []
         for block in self.transformer.h:
-            x = block(x)
+            if collect_head_stats:
+                x, head_stats = block(x, collect_head_stats=True)
+                all_head_stats.append(head_stats)
+            else:
+                x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -190,6 +212,8 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
+        if collect_head_stats:
+            return logits, loss, torch.stack(all_head_stats)
         return logits, loss
 
     def crop_block_size(self, block_size):

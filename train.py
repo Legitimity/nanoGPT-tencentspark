@@ -267,12 +267,23 @@ while True:
         if losses['val'] < best_val_loss:
             best_val_loss = losses['val']
         if wandb_log:
-            wandb.log({
-                "train/loss": losses['train'],
+            model.eval()
+            X_stats, Y_stats = get_batch('val')
+            with torch.no_grad(), ctx:
+                _, _, head_stats = model(X_stats, Y_stats, collect_head_stats=True)
+            model.train()
+            wandb_metrics = {
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            }, step=iter_num)
+            }
+            for layer_idx in range(head_stats.size(0)):
+                for head_idx in range(head_stats.size(1)):
+                    prefix = f"Charts/hidden_states/layer_{layer_idx}/head_{head_idx}"
+                    wandb_metrics[f"{prefix}/rms.avg"] = head_stats[layer_idx, head_idx, 0].item()
+                    wandb_metrics[f"{prefix}/rms.max"] = head_stats[layer_idx, head_idx, 1].item()
+                    wandb_metrics[f"{prefix}/abs.max"] = head_stats[layer_idx, head_idx, 2].item()
+            wandb.log(wandb_metrics, step=iter_num)
 
     # save checkpoint periodically (independent of eval)
     if always_save_checkpoint and iter_num > 0 and iter_num % save_interval == 0 and master_process:
@@ -308,10 +319,11 @@ while True:
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    # collect the pre-clipping gradient norm, then clip if enabled
+    scaler.unscale_(optimizer)
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), grad_clip if grad_clip > 0.0 else float('inf')
+    )
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
@@ -331,7 +343,8 @@ while True:
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     if wandb_log and master_process:
         wandb.log({
-            "train/batch_loss": lossf,
+            "train/lm_loss": lossf,
+            "train/grad_norm": grad_norm.item(),
             "lr": lr,
         }, step=iter_num)
     iter_num += 1
