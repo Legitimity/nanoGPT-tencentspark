@@ -277,12 +277,12 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             }
-            for layer_idx in range(head_stats.size(0)):
-                for head_idx in range(head_stats.size(1)):
-                    prefix = f"Charts/hidden_states/layer_{layer_idx}/head_{head_idx}"
-                    wandb_metrics[f"{prefix}/rms.avg"] = head_stats[layer_idx, head_idx, 0].item()
-                    wandb_metrics[f"{prefix}/rms.max"] = head_stats[layer_idx, head_idx, 1].item()
-                    wandb_metrics[f"{prefix}/abs.max"] = head_stats[layer_idx, head_idx, 2].item()
+            layer_stats = head_stats.mean(dim=1)
+            for layer_idx in range(layer_stats.size(0)):
+                prefix = f"Charts/hidden_states/layer_{layer_idx}"
+                wandb_metrics[f"{prefix}/rms.avg"] = layer_stats[layer_idx, 0].item()
+                wandb_metrics[f"{prefix}/rms.max"] = layer_stats[layer_idx, 1].item()
+                wandb_metrics[f"{prefix}/abs.max"] = layer_stats[layer_idx, 2].item()
             wandb.log(wandb_metrics, step=iter_num)
 
     # save checkpoint periodically (independent of eval)
