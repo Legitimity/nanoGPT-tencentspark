@@ -352,3 +352,51 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+
+# -----------------------------------------------------------------------------
+# Muon optimizer (MomentUm Orthogonalized by Newton-Schulz iteration)
+# reference: Keller Jordan, https://github.com/KellerJordan/modded-nanogpt
+# Muon is used for 2D weight matrices of hidden layers (attention/FFN);
+# embeddings, lm_head and 1D params (LayerNorm etc.) should stay on AdamW.
+
+@torch.no_grad()
+def zeropower_via_newtonschulz5(G, steps=5):
+    assert G.ndim == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    X = X / (X.norm() + 1e-7) # ensure spectral norm <= 1 before iteration
+    if G.size(0) > G.size(1):
+        X = X.T # transpose so the Gram matrix A is small
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.0):
+        defaults = dict(lr=lr, base_lr=lr, momentum=momentum, nesterov=nesterov,
+                        ns_steps=ns_steps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            for p in group['params']:
+                g = p.grad
+                if g is None:
+                    continue
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.mul_(group['momentum']).add_(g)
+                g = g.add(buf, alpha=group['momentum']) if group['nesterov'] else buf
+                g = zeropower_via_newtonschulz5(g, steps=group['ns_steps'])
+                if group['weight_decay'] > 0:
+                    p.mul_(1 - group['lr'] * group['weight_decay'])
+                # scale update to ~unit RMS regardless of matrix aspect ratio
+                p.add_(g, alpha=-group['lr'] * max(1.0, p.size(0) / p.size(1)) ** 0.5)

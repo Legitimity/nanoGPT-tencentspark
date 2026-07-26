@@ -27,7 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, Muon
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -59,7 +59,7 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
+learning_rate = 1e-3 # max learning rate
 max_iters = 5000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -69,7 +69,15 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 100 # how many steps to warm up for
 lr_decay_iters = 5000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+min_lr = 8e-7 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+lr_schedule = 'cosine' # 'cosine' or 'wsd' (warmup-stable-decay / trapezoidal)
+wsd_decay_frac = 0.2 # WSD: fraction of lr_decay_iters used for the final decay (annealing) phase
+wsd_decay_style = 'linear' # WSD: decay shape, 'linear' or 'cosine'
+# optimizer selection
+optimizer_name = 'muon' # 'adamw' or 'muon' (Muon for 2D attn/FFN matrices, AdamW for embeddings & 1D params)
+muon_lr = 0.02 # Muon learning rate (larger than adamw lr since Muon updates are orthogonalized)
+muon_momentum = 0.95 # Muon momentum
+muon_weight_decay = 0.1 # weight decay for Muon params (important for late-training stability, cf. Moonshot Muon paper)
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -200,9 +208,30 @@ model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+if optimizer_name == 'muon':
+    # Muon for 2D weight matrices of attention and FFN; AdamW for embeddings (wte/wpe, lm_head is tied) and 1D params
+    muon_params = [p for n, p in model.named_parameters() if p.ndim >= 2 and 'wte' not in n and 'wpe' not in n]
+    adam_decay = [p for n, p in model.named_parameters() if p.ndim >= 2 and ('wte' in n or 'wpe' in n)]
+    adam_nodecay = [p for n, p in model.named_parameters() if p.ndim < 2]
+    print(f"muon: {len(muon_params)} matrices, {sum(p.numel() for p in muon_params)/1e6:.2f}M params | "
+          f"adamw: {sum(p.numel() for p in adam_decay + adam_nodecay)/1e6:.2f}M params (embeddings + 1D)")
+    optimizers = [
+        Muon(muon_params, lr=muon_lr, momentum=muon_momentum, weight_decay=muon_weight_decay),
+        torch.optim.AdamW([
+            {'params': adam_decay, 'weight_decay': weight_decay},
+            {'params': adam_nodecay, 'weight_decay': 0.0},
+        ], lr=learning_rate, betas=(beta1, beta2), eps=1e-8, fused=(device_type == 'cuda')),
+    ]
+else:
+    optimizers = [model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)]
+# record base_lr so the lr schedule can scale all param groups proportionally
+for opt in optimizers:
+    for param_group in opt.param_groups:
+        param_group.setdefault('base_lr', param_group['lr'])
 if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
+    optimizers[-1].load_state_dict(checkpoint['optimizer']) # adamw state
+    if optimizer_name == 'muon' and checkpoint.get('optimizer_muon') is not None:
+        optimizers[0].load_state_dict(checkpoint['optimizer_muon'])
 checkpoint = None # free up memory
 
 # compile the model
@@ -253,7 +282,7 @@ def estimate_val_full():
     model.train()
     return total_loss / total_windows
 
-# learning rate decay scheduler (cosine with warmup)
+# learning rate decay scheduler (cosine or wsd/trapezoidal, with warmup)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
@@ -261,7 +290,16 @@ def get_lr(it):
     # 2) if it > lr_decay_iters, return min learning rate
     if it > lr_decay_iters:
         return min_lr
-    # 3) in between, use cosine decay down to min learning rate
+    if lr_schedule == 'wsd':
+        # 3a) warmup-stable-decay: constant lr until the last wsd_decay_frac of steps, then decay to min_lr
+        decay_start = lr_decay_iters * (1.0 - wsd_decay_frac)
+        if it < decay_start:
+            return learning_rate # stable phase
+        decay_ratio = (it - decay_start) / (lr_decay_iters - decay_start)
+        assert 0 <= decay_ratio <= 1
+        coeff = (1.0 - decay_ratio) if wsd_decay_style == 'linear' else 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return min_lr + coeff * (learning_rate - min_lr)
+    # 3b) in between, use cosine decay down to min learning rate
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
@@ -282,8 +320,10 @@ while True:
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    lr_scale = lr / learning_rate # schedule scale factor, applied to each group's base_lr
+    for opt in optimizers:
+        for param_group in opt.param_groups:
+            param_group['lr'] = param_group['base_lr'] * lr_scale
 
     # evaluate the loss on train/val sets
     if (eval_only or iter_num % eval_interval == 0) and master_process:
@@ -314,7 +354,8 @@ while True:
     if always_save_checkpoint and iter_num > 0 and iter_num % save_interval == 0 and master_process:
         checkpoint = {
             'model': raw_model.state_dict(),
-            'optimizer': optimizer.state_dict(),
+            'optimizer': optimizers[-1].state_dict(), # adamw state (backward compatible key)
+            'optimizer_muon': optimizers[0].state_dict() if optimizer_name == 'muon' else None,
             'model_args': model_args,
             'iter_num': iter_num,
             'best_val_loss': best_val_loss,
@@ -345,15 +386,19 @@ while True:
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # collect the pre-clipping gradient norm, then clip if enabled
-    scaler.unscale_(optimizer)
+    # muon/adamw params form a disjoint partition, so unscaling each optimizer scales every grad exactly once
+    for opt in optimizers:
+        scaler.unscale_(opt)
     grad_norm = torch.nn.utils.clip_grad_norm_(
         model.parameters(), grad_clip if grad_clip > 0.0 else float('inf')
     )
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
+    # step the optimizer(s) and scaler if training in fp16
+    for opt in optimizers:
+        scaler.step(opt)
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
+    for opt in optimizers:
+        opt.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()
