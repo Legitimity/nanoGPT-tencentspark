@@ -16,3 +16,5 @@ out/
 out-*/
 wandb/
 *.pt
+# Secrets
+wandbapi.txt
