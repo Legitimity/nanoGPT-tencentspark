@@ -231,6 +231,28 @@ def estimate_loss():
     model.train()
     return out
 
+# full-coverage validation loss: one sequential pass over non-overlapping windows of val.bin
+@torch.no_grad()
+def estimate_val_full():
+    model.eval()
+    data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    n_windows = (len(data) - 1) // block_size
+    total_loss, total_windows = 0.0, 0
+    for i in range(0, n_windows, batch_size):
+        hi = min(i + batch_size, n_windows)
+        x = torch.stack([torch.from_numpy(data[j*block_size:(j+1)*block_size].astype(np.int64)) for j in range(i, hi)])
+        y = torch.stack([torch.from_numpy(data[j*block_size+1:(j+1)*block_size+1].astype(np.int64)) for j in range(i, hi)])
+        if device_type == 'cuda':
+            x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        else:
+            x, y = x.to(device), y.to(device)
+        with ctx:
+            _, loss = model(x, y)
+        total_loss += loss.item() * (hi - i) # each window has equal length, so weight by window count
+        total_windows += hi - i
+    model.train()
+    return total_loss / total_windows
+
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -356,6 +378,14 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
+
+# final evaluation: full sequential pass over the entire validation set
+if master_process:
+    final_val_loss = estimate_val_full()
+    print(f"final val loss (full pass over val.bin): {final_val_loss:.4f}")
+    if wandb_log:
+        wandb.log({"val/final_loss_full": final_val_loss}, step=iter_num)
+        wandb.run.summary["val/final_loss_full"] = final_val_loss
 
 if ddp:
     destroy_process_group()
