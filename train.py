@@ -107,6 +107,7 @@ if ddp:
     gradient_accumulation_steps //= ddp_world_size
 else:
     # if not ddp, we are running on a single gpu, and one process
+    ddp_rank = 0
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
@@ -209,10 +210,32 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
 if optimizer_name == 'muon':
-    # Muon for 2D weight matrices of attention and FFN; AdamW for embeddings (wte/wpe, lm_head is tied) and 1D params
-    muon_params = [p for n, p in model.named_parameters() if p.ndim >= 2 and 'wte' not in n and 'wpe' not in n]
-    adam_decay = [p for n, p in model.named_parameters() if p.ndim >= 2 and ('wte' in n or 'wpe' in n)]
-    adam_nodecay = [p for n, p in model.named_parameters() if p.ndim < 2]
+    # Muon is restricted to 2D hidden-layer matrices. Everything else stays
+    # on AdamW, including tied token/output embeddings, position embeddings,
+    # LayerNorm gains, and biases.
+    named_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    muon_named = [
+        (n, p) for n, p in named_params
+        if p.ndim == 2 and n.startswith('transformer.h.')
+    ]
+    muon_ids = {id(p) for _, p in muon_named}
+    muon_params = [p for _, p in muon_named]
+    adam_decay = [
+        p for _, p in named_params
+        if id(p) not in muon_ids and p.ndim >= 2
+    ]
+    adam_nodecay = [
+        p for _, p in named_params
+        if id(p) not in muon_ids and p.ndim < 2
+    ]
+
+    # Fail early if a future model edit duplicates or omits a parameter.
+    all_ids = {id(p) for _, p in named_params}
+    adam_ids = {id(p) for p in adam_decay + adam_nodecay}
+    assert muon_ids.isdisjoint(adam_ids), "Muon and AdamW parameter groups overlap"
+    assert muon_ids | adam_ids == all_ids, "Optimizer parameter partition is incomplete"
+    assert all(p.ndim == 2 for p in muon_params), "Muon received a non-2D parameter"
+
     print(f"muon: {len(muon_params)} matrices, {sum(p.numel() for p in muon_params)/1e6:.2f}M params | "
           f"adamw: {sum(p.numel() for p in adam_decay + adam_nodecay)/1e6:.2f}M params (embeddings + 1D)")
     optimizers = [
@@ -229,9 +252,34 @@ for opt in optimizers:
     for param_group in opt.param_groups:
         param_group.setdefault('base_lr', param_group['lr'])
 if init_from == 'resume':
-    optimizers[-1].load_state_dict(checkpoint['optimizer']) # adamw state
-    if optimizer_name == 'muon' and checkpoint.get('optimizer_muon') is not None:
-        optimizers[0].load_state_dict(checkpoint['optimizer_muon'])
+    saved_optimizer_name = checkpoint.get(
+        'optimizer_name',
+        checkpoint.get('config', {}).get('optimizer_name'),
+    )
+    if saved_optimizer_name is not None and saved_optimizer_name != optimizer_name:
+        raise ValueError(
+            f"checkpoint optimizer is {saved_optimizer_name!r}, "
+            f"but current optimizer_name is {optimizer_name!r}"
+        )
+    optimizer_states = checkpoint.get('optimizers', {})
+    adamw_state = optimizer_states.get('adamw', checkpoint.get('optimizer'))
+    if adamw_state is None:
+        raise KeyError("checkpoint does not contain AdamW optimizer state")
+    optimizers[-1].load_state_dict(adamw_state)
+    if optimizer_name == 'muon':
+        muon_state = optimizer_states.get('muon', checkpoint.get('optimizer_muon'))
+        if muon_state is None:
+            raise KeyError("checkpoint does not contain Muon optimizer state")
+        optimizers[0].load_state_dict(muon_state)
+    # Older checkpoints may predate base_lr. Loading an optimizer state replaces
+    # its param-group dictionaries, so restore only the missing metadata here.
+    for opt_index, opt in enumerate(optimizers):
+        fallback_base_lr = (
+            muon_lr if optimizer_name == 'muon' and opt_index == 0
+            else learning_rate
+        )
+        for param_group in opt.param_groups:
+            param_group.setdefault('base_lr', fallback_base_lr)
 checkpoint = None # free up memory
 
 # compile the model
@@ -248,22 +296,24 @@ if ddp:
 @torch.no_grad()
 def estimate_loss():
     out = {}
-    model.eval()
+    # Evaluation runs only on the master process. Bypass the DDP wrapper so
+    # these forwards cannot trigger collectives that the other ranks do not join.
+    raw_model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = raw_model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
-    model.train()
+    raw_model.train()
     return out
 
 # full-coverage validation loss: one sequential pass over non-overlapping windows of val.bin
 @torch.no_grad()
 def estimate_val_full():
-    model.eval()
+    raw_model.eval()
     data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     n_windows = (len(data) - 1) // block_size
     total_loss, total_windows = 0.0, 0
@@ -276,10 +326,10 @@ def estimate_val_full():
         else:
             x, y = x.to(device), y.to(device)
         with ctx:
-            _, loss = model(x, y)
+            _, loss = raw_model(x, y)
         total_loss += loss.item() * (hi - i) # each window has equal length, so weight by window count
         total_windows += hi - i
-    model.train()
+    raw_model.train()
     return total_loss / total_windows
 
 # learning rate decay scheduler (cosine or wsd/trapezoidal, with warmup)
@@ -316,7 +366,42 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
-while True:
+
+def save_training_checkpoint(filename='ckpt.pt', final_val_loss=None):
+    """Atomically save model plus every optimizer state on the master rank."""
+    if not master_process:
+        return
+    optimizer_states = {
+        'adamw': optimizers[-1].state_dict(),
+        'muon': optimizers[0].state_dict() if optimizer_name == 'muon' else None,
+    }
+    checkpoint = {
+        'model': raw_model.state_dict(),
+        # Keep the legacy keys so older resume scripts can still read this file.
+        'optimizer': optimizer_states['adamw'],
+        'optimizer_muon': optimizer_states['muon'],
+        'optimizers': optimizer_states,
+        'optimizer_name': optimizer_name,
+        'model_args': model_args,
+        'iter_num': iter_num,
+        'best_val_loss': best_val_loss,
+        'config': config,
+    }
+    if final_val_loss is not None:
+        checkpoint['final_val_loss'] = final_val_loss
+    checkpoint_path = os.path.join(out_dir, filename)
+    temporary_path = checkpoint_path + '.tmp'
+    print(f"saving checkpoint to {checkpoint_path}")
+    torch.save(checkpoint, temporary_path)
+    os.replace(temporary_path, checkpoint_path)
+
+# Preserve nanoGPT's historical inclusive interpretation: max_iters is the
+# largest update index, so a fresh run executes updates 0, ..., max_iters.
+# Writing the target explicitly removes the accidental-looking `> max_iters`
+# termination test without changing the numerical training trajectory.
+target_num_updates = max_iters + 1
+did_train = False
+while iter_num < target_num_updates:
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -332,16 +417,19 @@ while True:
         if losses['val'] < best_val_loss:
             best_val_loss = losses['val']
         if wandb_log:
-            model.eval()
+            raw_model.eval()
             X_stats, Y_stats = get_batch('val')
             with torch.no_grad(), ctx:
-                _, _, head_stats = model(X_stats, Y_stats, collect_head_stats=True)
-            model.train()
+                _, _, head_stats = raw_model(X_stats, Y_stats, collect_head_stats=True)
+            raw_model.train()
             wandb_metrics = {
                 "val/loss": losses['val'],
                 "lr": lr,
+                "lr/adamw": optimizers[-1].param_groups[0]['lr'],
                 "mfu": running_mfu*100, # convert to percentage
             }
+            if optimizer_name == 'muon':
+                wandb_metrics["lr/muon"] = optimizers[0].param_groups[0]['lr']
             layer_stats = head_stats.mean(dim=1)
             for layer_idx in range(layer_stats.size(0)):
                 prefix = f"Charts/hidden_states/layer_{layer_idx}"
@@ -350,19 +438,6 @@ while True:
                 wandb_metrics[f"{prefix}/abs.max"] = layer_stats[layer_idx, 2].item()
             wandb.log(wandb_metrics, step=iter_num)
 
-    # save checkpoint periodically (independent of eval)
-    if always_save_checkpoint and iter_num > 0 and iter_num % save_interval == 0 and master_process:
-        checkpoint = {
-            'model': raw_model.state_dict(),
-            'optimizer': optimizers[-1].state_dict(), # adamw state (backward compatible key)
-            'optimizer_muon': optimizers[0].state_dict() if optimizer_name == 'muon' else None,
-            'model_args': model_args,
-            'iter_num': iter_num,
-            'best_val_loss': best_val_loss,
-            'config': config,
-        }
-        print(f"saving checkpoint to {out_dir}")
-        torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if eval_only:
         break
 
@@ -412,17 +487,24 @@ while True:
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     if wandb_log and master_process:
-        wandb.log({
+        wandb_metrics = {
             "train/lm_loss": lossf,
             "train/grad_norm": grad_norm.item(),
             "lr": lr,
-        }, step=iter_num)
+            "lr/adamw": optimizers[-1].param_groups[0]['lr'],
+        }
+        if optimizer_name == 'muon':
+            wandb_metrics["lr/muon"] = optimizers[0].param_groups[0]['lr']
+        wandb.log(wandb_metrics, step=iter_num)
     iter_num += 1
     local_iter_num += 1
+    did_train = True
 
-    # termination conditions
-    if iter_num > max_iters:
-        break
+    # Saving after the update makes iter_num mean "number of completed
+    # updates". At multiples of save_interval this is numerically the same
+    # model state that the old code saved before the next indexed update.
+    if always_save_checkpoint and iter_num % save_interval == 0:
+        save_training_checkpoint()
 
 # final evaluation: full sequential pass over the entire validation set
 if master_process:
@@ -431,6 +513,9 @@ if master_process:
     if wandb_log:
         wandb.log({"val/final_loss_full": final_val_loss}, step=iter_num)
         wandb.run.summary["val/final_loss_full"] = final_val_loss
+    if did_train:
+        # Persist the exact model state whose final validation loss is reported.
+        save_training_checkpoint(final_val_loss=final_val_loss)
 
 if ddp:
     destroy_process_group()

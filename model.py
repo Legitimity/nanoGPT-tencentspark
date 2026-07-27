@@ -31,8 +31,11 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # separate key, query, value projections (split so Muon orthogonalizes each projection
+        # independently instead of treating the fused QKV map as one coupled matrix)
+        self.wq = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.wk = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.wv = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
@@ -53,7 +56,7 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        q, k, v = self.wq(x), self.wk(x), self.wv(x)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -269,18 +272,37 @@ class GPT(nn.Module):
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        copied = set()
         for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
+            if k.endswith('attn.c_attn.weight'):
+                # our model splits the fused QKV projection into separate wq/wk/wv matrices
+                w = sd_hf[k].t() # Conv1D -> Linear
+                E = w.size(1)
+                with torch.no_grad():
+                    for name, part in [('wq', w[:E]), ('wk', w[E:2*E]), ('wv', w[2*E:])]:
+                        key = k.replace('c_attn', name)
+                        sd[key].copy_(part)
+                        copied.add(key)
+            elif k.endswith('attn.c_attn.bias'):
+                E = sd_hf[k].size(0) // 3
+                with torch.no_grad():
+                    for name, part in [('wq', sd_hf[k][:E]), ('wk', sd_hf[k][E:2*E]), ('wv', sd_hf[k][2*E:])]:
+                        key = k.replace('c_attn', name)
+                        sd[key].copy_(part)
+                        copied.add(key)
+            elif any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
                 assert sd_hf[k].shape[::-1] == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k].t())
+                copied.add(k)
             else:
                 # vanilla copy over the other parameters
                 assert sd_hf[k].shape == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
+                copied.add(k)
+        assert copied == set(sd_keys), f"uncopied model keys: {set(sd_keys) - copied}"
 
         return model
 
