@@ -44,6 +44,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.qk_norm = config.qk_norm
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -60,6 +61,11 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        if self.qk_norm:
+            # QK-Norm: parameter-free RMS normalization per head, keeps attention logits
+            # at controlled scale and prevents logit blow-up during high-lr phases
+            q = F.rms_norm(q, (q.size(-1),))
+            k = F.rms_norm(k, (k.size(-1),))
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -134,6 +140,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    qk_norm: bool = True # whether to RMS-normalize q and k per head before attention (QK-Norm)
 
 class GPT(nn.Module):
 
@@ -234,8 +241,11 @@ class GPT(nn.Module):
     def from_pretrained(cls, model_type, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
+        # Dropout and parameter-free QK-Norm do not change checkpoint tensor
+        # shapes, so both may be selected when importing GPT-2 weights.
+        allowed_overrides = {'dropout', 'qk_norm'}
+        assert all(k in allowed_overrides for k in override_args), \
+            f"unsupported override keys: {set(override_args) - allowed_overrides}"
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
@@ -250,10 +260,13 @@ class GPT(nn.Module):
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
         config_args['bias'] = True # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
+        # We can override dropout and QK-Norm without affecting weight shapes.
         if 'dropout' in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
+        if 'qk_norm' in override_args:
+            print(f"overriding QK-Norm to {override_args['qk_norm']}")
+            config_args['qk_norm'] = override_args['qk_norm']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)

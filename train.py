@@ -58,6 +58,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+qk_norm = True # whether to RMS-normalize q,k per head before attention (QK-Norm)
 # adamw optimizer
 learning_rate = 1e-3 # max learning rate
 max_iters = 5000 # total number of training iterations
@@ -158,7 +159,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, qk_norm=qk_norm) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -174,9 +175,23 @@ elif init_from == 'resume':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    # Force architecture and forward-semantics attributes to match the
+    # checkpoint. qk_norm has no state_dict tensor, so load_state_dict cannot
+    # detect a mismatch for us; it must be restored explicitly.
+    checkpoint_model_keys = [
+        'n_layer', 'n_head', 'n_embd', 'block_size',
+        'bias', 'vocab_size', 'qk_norm',
+    ]
+    missing_model_keys = [
+        k for k in checkpoint_model_keys if k not in checkpoint_model_args
+    ]
+    if missing_model_keys:
+        raise KeyError(
+            "checkpoint model_args is missing required keys: "
+            f"{missing_model_keys}. Automatic legacy fused-QKV checkpoint "
+            "migration is intentionally not performed."
+        )
+    for k in checkpoint_model_keys:
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
@@ -194,10 +209,10 @@ elif init_from == 'resume':
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
+    override_args = dict(dropout=dropout, qk_norm=qk_norm)
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'qk_norm']:
         model_args[k] = getattr(model.config, k)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
