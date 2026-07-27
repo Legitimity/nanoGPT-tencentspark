@@ -77,7 +77,7 @@ wsd_decay_style = 'linear' # WSD: decay shape, 'linear' or 'cosine'
 optimizer_name = 'muon' # 'adamw' or 'muon' (Muon for 2D attn/FFN matrices, AdamW for embeddings & 1D params)
 muon_lr = 0.02 # Muon learning rate (larger than adamw lr since Muon updates are orthogonalized)
 muon_momentum = 0.95 # Muon momentum
-muon_weight_decay = 0.1 # weight decay for Muon params (important for late-training stability, cf. Moonshot Muon paper)
+muon_weight_decay = 0.005 # weight decay for Muon params; calibrated so lr*wd shrink rate matches the AdamW side (0.02*0.005 = 1e-3*0.1)
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
