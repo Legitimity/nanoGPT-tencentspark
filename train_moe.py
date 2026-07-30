@@ -27,7 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model_fusedqkv import GPTConfig, GPT, Muon
+from model_moe import GPTConfig, GPT, Muon
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -49,8 +49,8 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 20 # larger micro-batch -> fewer, larger grouped GEMMs (measured ~11% faster at iso tokens/iter)
+batch_size = 24 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -61,7 +61,19 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 qk_norm = True # whether to RMS-normalize q,k per head before attention (QK-Norm)
 qk_scale = True # whether to learn a per-head temperature multiplied onto q (after QK-Norm)
 fused_qkv = True # single forward GEMM; Muon keeps Q/K/V logical matrices separate
-ce_chunk_size = 4096 # tokens per chunk for chunked cross-entropy (exact); 0 = standard CE
+ce_chunk_size = 0 # chunked CE disabled (slower under compile); model file accepts the arg
+# one-bank Value Embeddings: one token table shared by the final four layers
+value_embeds = True
+value_embed_start_layer = 8 # zero-based
+value_embed_num_layers = 4 # exactly layers 8,9,10,11 receive the shared bank
+value_embed_gate_init = 1.0 # additive per-layer/per-head gain
+value_embed_init_std = 0.02 # small relative to the initial projected V RMS
+value_embed_lr_scale = 1.0 # relative to AdamW learning_rate; no weight decay
+# MoE FFN (top-1 routing, active compute ~= dense, dispatch ops halved vs top-2)
+moe_num_experts = 4 # routed experts per layer
+moe_top_k = 1 # experts per token (Switch-style; plain scatter combine, no atomics)
+moe_expert_dim = 3072 # expert intermediate dim (= dense FFN, keeps active FLOPs at dense parity)
+moe_aux_loss_coef = 0.01 # load-balancing loss weight (training only)
 # adamw optimizer
 learning_rate = 1e-3 # max learning rate
 max_iters = 5000 # total number of training iterations
@@ -170,6 +182,12 @@ model_args = dict(
     n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
     bias=bias, vocab_size=None, dropout=dropout, qk_norm=qk_norm,
     qk_scale=qk_scale, fused_qkv=fused_qkv, ce_chunk_size=ce_chunk_size,
+    value_embeds=value_embeds, value_embed_start_layer=value_embed_start_layer,
+    value_embed_num_layers=value_embed_num_layers,
+    value_embed_gate_init=value_embed_gate_init,
+    value_embed_init_std=value_embed_init_std,
+    moe_num_experts=moe_num_experts, moe_top_k=moe_top_k,
+    moe_expert_dim=moe_expert_dim, moe_aux_loss_coef=moe_aux_loss_coef,
 ) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
@@ -192,6 +210,8 @@ elif init_from == 'resume':
     checkpoint_model_keys = [
         'n_layer', 'n_head', 'n_embd', 'block_size',
         'bias', 'vocab_size', 'qk_norm', 'qk_scale', 'fused_qkv',
+        'value_embeds', 'value_embed_start_layer', 'value_embed_num_layers',
+        'value_embed_gate_init', 'value_embed_init_std',
     ]
     missing_model_keys = [
         k for k in checkpoint_model_keys if k not in checkpoint_model_args
@@ -253,12 +273,17 @@ if optimizer_name == 'muon':
     named_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     muon_named = [
         (n, p) for n, p in named_params
-        if p.ndim == 2 and n.startswith('transformer.h.')
+        if p.ndim == 2 and n.startswith('transformer.h.') and 'router' not in n
     ]
     qkv_muon_named = [(n, p) for n, p in muon_named if n.endswith('.attn.wqkv.weight')]
-    regular_muon_named = [(n, p) for n, p in muon_named if not n.endswith('.attn.wqkv.weight')]
+    moe_packed_named = [(n, p) for n, p in muon_named if n.endswith(('.mlp.w1', '.mlp.w2'))]
+    regular_muon_named = [
+        (n, p) for n, p in muon_named
+        if not n.endswith('.attn.wqkv.weight') and not n.endswith(('.mlp.w1', '.mlp.w2'))
+    ]
     muon_ids = {id(p) for _, p in muon_named}
     qkv_muon_params = [p for _, p in qkv_muon_named]
+    moe_packed_params = [p for _, p in moe_packed_named]
     regular_muon_params = [p for _, p in regular_muon_named]
     assert len(qkv_muon_params) == model.config.n_layer, "expected exactly one fused QKV matrix per layer"
     assert all(
@@ -279,7 +304,10 @@ if optimizer_name == 'muon':
     assert muon_ids | adam_ids == all_ids, "Optimizer parameter partition is incomplete"
     assert all(p.ndim == 2 for _, p in muon_named), "Muon received a non-2D parameter"
 
-    logical_muon_matrices = len(regular_muon_params) + 3 * len(qkv_muon_params)
+    logical_muon_matrices = (
+        len(regular_muon_params) + 3 * len(qkv_muon_params)
+        + moe_num_experts * len(moe_packed_params)
+    )
     muon_parameter_count = sum(p.numel() for _, p in muon_named)
     print(
         f"muon: {logical_muon_matrices} logical matrices in "
@@ -294,6 +322,7 @@ if optimizer_name == 'muon':
     muon_groups = [
         {'params': regular_muon_params, 'muon_split_rows': 1},
         {'params': qkv_muon_params, 'muon_split_rows': 3},
+        {'params': moe_packed_params, 'muon_split_rows': moe_num_experts},
     ]
     optimizers = [
         Muon(muon_groups, lr=muon_lr, momentum=muon_momentum, weight_decay=muon_weight_decay),

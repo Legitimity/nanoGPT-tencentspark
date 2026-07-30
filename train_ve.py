@@ -27,7 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model_fusedqkv import GPTConfig, GPT, Muon
+from model_value1bank import GPTConfig, GPT, Muon
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -61,7 +61,14 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 qk_norm = True # whether to RMS-normalize q,k per head before attention (QK-Norm)
 qk_scale = True # whether to learn a per-head temperature multiplied onto q (after QK-Norm)
 fused_qkv = True # single forward GEMM; Muon keeps Q/K/V logical matrices separate
-ce_chunk_size = 4096 # tokens per chunk for chunked cross-entropy (exact); 0 = standard CE
+ce_chunk_size = 0 # chunked CE disabled (slower under compile); model file accepts the arg
+# one-bank Value Embeddings: one token table shared by the final four layers
+value_embeds = True
+value_embed_start_layer = 8 # zero-based
+value_embed_num_layers = 4 # exactly layers 8,9,10,11 receive the shared bank
+value_embed_gate_init = 1.0 # additive per-layer/per-head gain
+value_embed_init_std = 0.02 # small relative to the initial projected V RMS
+value_embed_lr_scale = 1.0 # relative to AdamW learning_rate; no weight decay
 # adamw optimizer
 learning_rate = 1e-3 # max learning rate
 max_iters = 5000 # total number of training iterations
@@ -170,6 +177,10 @@ model_args = dict(
     n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
     bias=bias, vocab_size=None, dropout=dropout, qk_norm=qk_norm,
     qk_scale=qk_scale, fused_qkv=fused_qkv, ce_chunk_size=ce_chunk_size,
+    value_embeds=value_embeds, value_embed_start_layer=value_embed_start_layer,
+    value_embed_num_layers=value_embed_num_layers,
+    value_embed_gate_init=value_embed_gate_init,
+    value_embed_init_std=value_embed_init_std,
 ) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
@@ -192,6 +203,8 @@ elif init_from == 'resume':
     checkpoint_model_keys = [
         'n_layer', 'n_head', 'n_embd', 'block_size',
         'bias', 'vocab_size', 'qk_norm', 'qk_scale', 'fused_qkv',
+        'value_embeds', 'value_embed_start_layer', 'value_embed_num_layers',
+        'value_embed_gate_init', 'value_embed_init_std',
     ]
     missing_model_keys = [
         k for k in checkpoint_model_keys if k not in checkpoint_model_args

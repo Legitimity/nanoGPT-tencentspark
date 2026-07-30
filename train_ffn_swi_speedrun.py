@@ -27,7 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model_fusedqkv import GPTConfig, GPT, Muon
+from model_ffn_swi_speedrun import GPTConfig, GPT, Muon
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -38,8 +38,8 @@ save_interval = 500 # save a checkpoint every N iterations (only when always_sav
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 
 #eval stuff
-eval_interval = 100
-eval_iters = 20
+eval_interval = 500
+eval_iters = 10
 log_interval = 10
 eval_only = False # if True, script exits right after the first eval
 
@@ -49,8 +49,8 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 20 # larger micro-batch -> fewer, larger grouped GEMMs (measured ~11% faster at iso tokens/iter)
+batch_size = 24 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -61,7 +61,29 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 qk_norm = True # whether to RMS-normalize q,k per head before attention (QK-Norm)
 qk_scale = True # whether to learn a per-head temperature multiplied onto q (after QK-Norm)
 fused_qkv = True # single forward GEMM; Muon keeps Q/K/V logical matrices separate
-ce_chunk_size = 4096 # tokens per chunk for chunked cross-entropy (exact); 0 = standard CE
+ce_chunk_size = 0 # chunked CE disabled (slower under compile); model file accepts the arg
+# one-bank Value Embeddings: one token table shared by the final four layers
+value_embeds = True
+value_embed_start_layer = 8 # zero-based
+value_embed_num_layers = 4 # exactly layers 8,9,10,11 receive the shared bank
+value_embed_gate_init = 1.0 # additive per-layer/per-head gain
+value_embed_init_std = 0.02 # small relative to the initial projected V RMS
+value_embed_lr_scale = 1.0 # relative to AdamW learning_rate (now actually applied to vte in the Muon path)
+# P0 embedding-decay fix: wte/wpe/vte are 2D and used to land in the plain AdamW
+# decay group at weight_decay; vte's "no decay" comment was not implemented and
+# value_embed_lr_scale had no effect in the Muon path. OLMo 2's ablation finds
+# embedding decay crushes the embedding norm; disabling costs no throughput.
+value_embed_decay = 0.0 # VE bank weight decay (step 1 of the fix)
+embedding_decay = 0.1 # wte/wpe weight decay; set 0.0 for step 2 (all embeddings no decay; note wte is tied to the LM head)
+resid_init_scale = 0.1 # residual-projection init std multiplier (much smaller than default 1.0)
+fused_ce = True # training-path fused linear CE (cut-cross-entropy); False = plain CE path
+# Final readout backout: mix normalized block-7 output with the normalized final
+# stream. [1, 0] is exactly baseline-equivalent at initialization.
+readout_backout = True
+readout_backout_layer = 7
+readout_backout_final_init = 1.0
+readout_backout_skip_init = 0.0
+# Dense FFN variant (relu**2): no MoE config; architecture matches model_ve_ri_relu2_gate.py
 # adamw optimizer
 learning_rate = 1e-3 # max learning rate
 max_iters = 5000 # total number of training iterations
@@ -72,10 +94,9 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 100 # how many steps to warm up for
-lr_decay_iters = 5000 # should be ~= max_iters per Chinchilla
 min_lr = 8e-7 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 lr_schedule = 'cosine' # 'cosine' or 'wsd' (warmup-stable-decay / trapezoidal)
-wsd_decay_frac = 0.2 # WSD: fraction of lr_decay_iters used for the final decay (annealing) phase
+wsd_decay_frac = 0.2 # WSD: fraction of max_iters used for the final decay (annealing) phase
 wsd_decay_style = 'linear' # WSD: decay shape, 'linear' or 'cosine'
 # optimizer selection
 optimizer_name = 'muon' # 'adamw' or 'muon' (Muon for 2D attn/FFN matrices, AdamW for embeddings & 1D params)
@@ -88,9 +109,20 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+compile_mode = '' # torch.compile mode; '' = default. Try 'max-autotune' when tuning for speed
+# fixed-wall-clock mode (single GPU or DDP). The timer starts immediately before the
+# first optimizer update (lazy torch.compile time is therefore included), stops
+# after the last complete update at/after the limit, then runs full validation.
+# max_iters is estimated after warmup and used only as the LR-schedule horizon;
+# wall-clock time remains the only speedrun termination condition.
+speedrun_mode = False
+speedrun_time_limit_seconds = 14400 # 4 hours of timed training; final validation is outside this limit
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
+# There is one schedule horizon in every mode. Ordinary runs use the configured
+# max_iters directly; speedrun mode replaces max_iters with a warmup-based upper
+# estimate before the decay phase begins.
 # -----------------------------------------------------------------------------
 # Scale eval_iters inversely with micro-batch size so each evaluation covers the same
 # number of tokens as the batch_size=6 baseline (eval_iters=20 -> ~123K tokens).
@@ -101,6 +133,26 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if lr_schedule not in {'cosine', 'wsd'}:
+    raise ValueError(f"unsupported lr_schedule: {lr_schedule!r}")
+if lr_schedule == 'wsd':
+    if not 0.0 < wsd_decay_frac <= 1.0:
+        raise ValueError("wsd_decay_frac must be in (0, 1]")
+    if wsd_decay_style not in {'linear', 'cosine'}:
+        raise ValueError(f"unsupported wsd_decay_style: {wsd_decay_style!r}")
+if speedrun_mode:
+    if init_from != 'scratch':
+        raise ValueError("speedrun_mode currently requires init_from='scratch'")
+    if eval_only:
+        raise ValueError("speedrun_mode and eval_only cannot both be enabled")
+    if speedrun_time_limit_seconds <= 0:
+        raise ValueError("speedrun_time_limit_seconds must be positive")
+    if warmup_iters < 4:
+        raise ValueError("speedrun_mode requires warmup_iters >= 4 to estimate max_iters")
+    print(
+        f"speedrun mode: {speedrun_time_limit_seconds:.1f}s training limit, "
+        f"world_size={int(os.environ.get('WORLD_SIZE', 1))}, no periodic checkpoints; max_iters is ignored"
+    )
 if ddp:
     init_process_group(backend=backend)
     ddp_rank = int(os.environ['RANK'])
@@ -129,6 +181,8 @@ torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+if speedrun_mode and device_type != 'cuda':
+    raise ValueError("speedrun_mode requires a CUDA device")
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
@@ -170,6 +224,16 @@ model_args = dict(
     n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
     bias=bias, vocab_size=None, dropout=dropout, qk_norm=qk_norm,
     qk_scale=qk_scale, fused_qkv=fused_qkv, ce_chunk_size=ce_chunk_size,
+    value_embeds=value_embeds, value_embed_start_layer=value_embed_start_layer,
+    value_embed_num_layers=value_embed_num_layers,
+    value_embed_gate_init=value_embed_gate_init,
+    value_embed_init_std=value_embed_init_std,
+    resid_init_scale=resid_init_scale,
+    fused_ce=fused_ce,
+    readout_backout=readout_backout,
+    readout_backout_layer=readout_backout_layer,
+    readout_backout_final_init=readout_backout_final_init,
+    readout_backout_skip_init=readout_backout_skip_init,
 ) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
@@ -192,6 +256,11 @@ elif init_from == 'resume':
     checkpoint_model_keys = [
         'n_layer', 'n_head', 'n_embd', 'block_size',
         'bias', 'vocab_size', 'qk_norm', 'qk_scale', 'fused_qkv',
+        'value_embeds', 'value_embed_start_layer', 'value_embed_num_layers',
+        'value_embed_gate_init', 'value_embed_init_std',
+        'resid_init_scale',
+        'readout_backout', 'readout_backout_layer',
+        'readout_backout_final_init', 'readout_backout_skip_init',
     ]
     missing_model_keys = [
         k for k in checkpoint_model_keys if k not in checkpoint_model_args
@@ -220,12 +289,28 @@ elif init_from == 'resume':
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout, qk_norm=qk_norm, qk_scale=qk_scale)
+    override_args = dict(
+        dropout=dropout, qk_norm=qk_norm, qk_scale=qk_scale,
+        value_embeds=value_embeds,
+        value_embed_start_layer=value_embed_start_layer,
+        value_embed_num_layers=value_embed_num_layers,
+        value_embed_gate_init=value_embed_gate_init,
+        value_embed_init_std=value_embed_init_std,
+        resid_init_scale=resid_init_scale,
+        readout_backout=readout_backout,
+        readout_backout_layer=readout_backout_layer,
+        readout_backout_final_init=readout_backout_final_init,
+        readout_backout_skip_init=readout_backout_skip_init,
+    )
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
     for k in [
         'n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size',
         'qk_norm', 'qk_scale', 'fused_qkv',
+        'value_embeds', 'value_embed_start_layer', 'value_embed_num_layers',
+        'value_embed_gate_init', 'value_embed_init_std', 'resid_init_scale',
+        'readout_backout', 'readout_backout_layer',
+        'readout_backout_final_init', 'readout_backout_skip_init',
     ]:
         model_args[k] = getattr(model.config, k)
 # Cropping a resumed model would leave the saved AdamW state for position
@@ -238,6 +323,7 @@ if init_from == 'resume' and block_size != model.config.block_size:
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
+config.update(model_args)
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -253,33 +339,46 @@ if optimizer_name == 'muon':
     named_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     muon_named = [
         (n, p) for n, p in named_params
-        if p.ndim == 2 and n.startswith('transformer.h.')
+        if p.ndim == 2 and n.startswith('transformer.h.') and 'router' not in n
     ]
     qkv_muon_named = [(n, p) for n, p in muon_named if n.endswith('.attn.wqkv.weight')]
-    regular_muon_named = [(n, p) for n, p in muon_named if not n.endswith('.attn.wqkv.weight')]
+    regular_muon_named = [
+        (n, p) for n, p in muon_named
+        if not n.endswith('.attn.wqkv.weight')
+    ]
     muon_ids = {id(p) for _, p in muon_named}
     qkv_muon_params = [p for _, p in qkv_muon_named]
     regular_muon_params = [p for _, p in regular_muon_named]
-    assert len(qkv_muon_params) == model.config.n_layer, "expected exactly one fused QKV matrix per layer"
+    assert len(qkv_muon_params) == model.config.n_layer, "expected exactly one fused QKV+gate matrix per layer"
     assert all(
-        p.shape == (3 * model.config.n_embd, model.config.n_embd)
+        p.shape == (4 * model.config.n_embd, model.config.n_embd)
         for p in qkv_muon_params
     )
+    # P0 embedding-decay fix: token/position/value embeddings get dedicated
+    # AdamW groups instead of decaying at weight_decay like ordinary 2D params.
+    embedding_named = [
+        (n, p) for n, p in named_params
+        if n in {'transformer.wte.weight', 'transformer.wpe.weight'}
+    ]
+    value_embed_named = [(n, p) for n, p in named_params if n == 'transformer.vte.weight']
+    embedding_ids = {id(p) for _, p in embedding_named + value_embed_named}
     adam_decay = [
-        p for _, p in named_params if id(p) not in muon_ids and p.ndim >= 2
+        p for _, p in named_params
+        if id(p) not in muon_ids and id(p) not in embedding_ids and p.ndim >= 2
     ]
     adam_nodecay = [
-        p for _, p in named_params if id(p) not in muon_ids and p.ndim < 2
+        p for _, p in named_params
+        if id(p) not in muon_ids and id(p) not in embedding_ids and p.ndim < 2
     ]
 
     # Fail early if a future model edit duplicates or omits a parameter.
     all_ids = {id(p) for _, p in named_params}
-    adam_ids = {id(p) for p in adam_decay + adam_nodecay}
+    adam_ids = {id(p) for p in adam_decay + adam_nodecay} | embedding_ids
     assert muon_ids.isdisjoint(adam_ids), "Muon and AdamW parameter groups overlap"
     assert muon_ids | adam_ids == all_ids, "Optimizer parameter partition is incomplete"
     assert all(p.ndim == 2 for _, p in muon_named), "Muon received a non-2D parameter"
 
-    logical_muon_matrices = len(regular_muon_params) + 3 * len(qkv_muon_params)
+    logical_muon_matrices = len(regular_muon_params) + 4 * len(qkv_muon_params)
     muon_parameter_count = sum(p.numel() for _, p in muon_named)
     print(
         f"muon: {logical_muon_matrices} logical matrices in "
@@ -291,9 +390,24 @@ if optimizer_name == 'muon':
         {'params': adam_decay, 'weight_decay': weight_decay},
         {'params': adam_nodecay, 'weight_decay': 0.0},
     ]
+    if embedding_named:
+        adam_groups.append({
+            'params': [p for _, p in embedding_named],
+            'weight_decay': embedding_decay, 'group_name': 'embedding',
+        })
+    if value_embed_named:
+        adam_groups.append({
+            'params': [p for _, p in value_embed_named],
+            'weight_decay': value_embed_decay,
+            'lr': learning_rate * value_embed_lr_scale, 'group_name': 'value_embed',
+        })
+    print(
+        f"embedding decay: wte/wpe {embedding_decay:g}, vte {value_embed_decay:g} "
+        f"(vte lr x{value_embed_lr_scale:g})"
+    )
     muon_groups = [
         {'params': regular_muon_params, 'muon_split_rows': 1},
-        {'params': qkv_muon_params, 'muon_split_rows': 3},
+        {'params': qkv_muon_params, 'muon_split_rows': 4}, # Q/K/V/gate row blocks
     ]
     optimizers = [
         Muon(muon_groups, lr=muon_lr, momentum=muon_momentum, weight_decay=muon_weight_decay),
@@ -345,7 +459,7 @@ checkpoint = None # free up memory
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+    model = torch.compile(model, mode=compile_mode or None) # requires PyTorch 2.0
 
 # wrap model into DDP container
 if ddp:
@@ -391,27 +505,38 @@ def estimate_val_full():
     raw_model.train()
     return total_loss / total_windows
 
-# learning rate decay scheduler (cosine or wsd/trapezoidal, with warmup)
+# One iteration-based schedule for every mode. max_iters is both the ordinary
+# run limit and the LR horizon. In speedrun mode max_iters is replaced after
+# warmup by a conservative upper estimate; elapsed time remains the only stop.
 def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
+    # Before the speedrun estimate exists, the configured max_iters is ignored.
+    if speedrun_mode and speedrun_nominal_max_iters is None:
+        if it < warmup_iters:
+            return learning_rate * (it + 1) / (warmup_iters + 1)
+        raise RuntimeError("speedrun reached post-warmup scheduling without a max_iters estimate")
+    # max_iters is the schedule endpoint in every non-speedrun mode, including
+    # intentionally short debug runs whose endpoint falls inside warmup.
+    if it >= max_iters:
+        return min_lr
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_decay_iters:
-        return min_lr
     if lr_schedule == 'wsd':
-        # 3a) warmup-stable-decay: constant lr until the last wsd_decay_frac of steps, then decay to min_lr
-        decay_start = lr_decay_iters * (1.0 - wsd_decay_frac)
+        # Never overlap cooldown with update-based warmup, including debug runs
+        # whose max_iters is unusually small.
+        decay_start = max(float(warmup_iters), max_iters * (1.0 - wsd_decay_frac))
         if it < decay_start:
-            return learning_rate # stable phase
-        decay_ratio = (it - decay_start) / (lr_decay_iters - decay_start)
-        assert 0 <= decay_ratio <= 1
-        coeff = (1.0 - decay_ratio) if wsd_decay_style == 'linear' else 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+            return learning_rate
+        decay_duration = max(max_iters - decay_start, 1.0)
+        decay_ratio = min(max((it - decay_start) / decay_duration, 0.0), 1.0)
+        coeff = (
+            1.0 - decay_ratio
+            if wsd_decay_style == 'linear'
+            else 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        )
         return min_lr + coeff * (learning_rate - min_lr)
-    # 3b) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+    decay_duration = max(max_iters - warmup_iters, 1)
+    decay_ratio = min(max((it - warmup_iters) / decay_duration, 0.0), 1.0)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (learning_rate - min_lr)
 
 # logging
@@ -420,13 +545,26 @@ if wandb_log and master_process:
     wandb.init(entity='jqh333', project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
-t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+# Start after model/optimizer/W&B setup but before the first batch. Lazy
+# torch.compile, all training batches, logging and optimizer work are timed.
+speedrun_start_time = time.monotonic() if speedrun_mode else None
+speedrun_elapsed = 0.0
+speedrun_termination_reason = None
+speedrun_probe_start_iter = max(1, warmup_iters // 2)
+speedrun_probe_start_time = None
+speedrun_average_update_seconds = None
+speedrun_nominal_max_iters = None
+speedrun_headroom_updates = None
+speedrun_horizon_extensions = 0
+speedrun_initial_max_iters = max_iters
+previous_scheduled_lr = None
+t0 = time.perf_counter()
+X, Y = get_batch('train') # fetch the very first timed training batch
 
-def save_training_checkpoint(filename='ckpt.pt', final_val_loss=None):
+def save_training_checkpoint(filename='ckpt.pt', final_val_loss=None, speedrun_metadata=None):
     """Atomically save model plus every optimizer state on the master rank."""
     if not master_process:
         return
@@ -448,11 +586,24 @@ def save_training_checkpoint(filename='ckpt.pt', final_val_loss=None):
     }
     if final_val_loss is not None:
         checkpoint['final_val_loss'] = final_val_loss
+    if speedrun_metadata is not None:
+        checkpoint['speedrun'] = speedrun_metadata
     checkpoint_path = os.path.join(out_dir, filename)
     temporary_path = checkpoint_path + '.tmp'
     print(f"saving checkpoint to {checkpoint_path}")
     torch.save(checkpoint, temporary_path)
     os.replace(temporary_path, checkpoint_path)
+
+def speedrun_should_stop(elapsed):
+    # The time-limit stop must be unanimous across ranks: if one rank broke out
+    # while another continued, DDP collectives would hang. Decide by the slowest
+    # rank with a tiny all-reduce.
+    stop = elapsed >= speedrun_time_limit_seconds
+    if ddp:
+        flag = torch.tensor([1.0 if stop else 0.0], device=device)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        stop = flag.item() > 0.5
+    return stop
 
 # Preserve nanoGPT's historical inclusive interpretation: max_iters is the
 # largest update index, so a fresh run executes updates 0, ..., max_iters.
@@ -460,16 +611,92 @@ def save_training_checkpoint(filename='ckpt.pt', final_val_loss=None):
 # termination test without changing the numerical training trajectory.
 target_num_updates = max_iters + 1
 did_train = False
-while iter_num < target_num_updates:
+# In speedrun mode wall-clock time is the only stop condition. max_iters is
+# estimated once at warmup completion and then serves only as the LR horizon.
+while speedrun_mode or iter_num < target_num_updates:
+    if speedrun_mode:
+        speedrun_elapsed = time.monotonic() - speedrun_start_time
+        if speedrun_should_stop(speedrun_elapsed):
+            torch.cuda.synchronize()
+            speedrun_elapsed = time.monotonic() - speedrun_start_time
+            speedrun_termination_reason = 'time_limit'
+            break
 
-    # determine and set the learning rate for this iteration
+        # Measure the second half of warmup between two synchronized boundaries;
+        # this excludes lazy compile and early kernel autotuning from the rate
+        # estimate while still using the requested warmup phase.
+        if iter_num == speedrun_probe_start_iter and speedrun_probe_start_time is None:
+            torch.cuda.synchronize()
+            speedrun_probe_start_time = time.monotonic()
+        if iter_num == warmup_iters and speedrun_nominal_max_iters is None:
+            torch.cuda.synchronize()
+            estimate_time = time.monotonic()
+            measured_updates = warmup_iters - speedrun_probe_start_iter
+            measured_seconds = estimate_time - speedrun_probe_start_time
+            if measured_updates <= 0 or measured_seconds <= 0:
+                raise RuntimeError("invalid speedrun warmup timing sample")
+            speedrun_average_update_seconds = measured_seconds / measured_updates
+            speedrun_elapsed = estimate_time - speedrun_start_time
+            remaining_seconds = max(speedrun_time_limit_seconds - speedrun_elapsed, 0.0)
+            estimated_remaining_updates = math.ceil(
+                remaining_seconds / speedrun_average_update_seconds
+            )
+            speedrun_nominal_max_iters = iter_num + estimated_remaining_updates
+            # One-percent upward headroom (at least two updates) keeps max_iters
+            # beyond the expected time-limited endpoint without materially
+            # distorting cosine/WSD decay progress.
+            speedrun_headroom_updates = max(
+                2, math.ceil(speedrun_nominal_max_iters * 0.01)
+            )
+            max_iters = speedrun_nominal_max_iters + speedrun_headroom_updates
+            # The LR horizon must be identical on every rank; rank 0's warmup
+            # timing sample wins.
+            if ddp:
+                horizon = torch.tensor([max_iters], dtype=torch.long, device=device)
+                torch.distributed.broadcast(horizon, src=0)
+                max_iters = horizon.item()
+            config['max_iters'] = max_iters
+            print(
+                f"speedrun warmup estimate: {speedrun_average_update_seconds*1000:.2f}ms/update, "
+                f"nominal {speedrun_nominal_max_iters} updates, schedule max_iters={max_iters} "
+                f"(+{speedrun_headroom_updates} headroom)"
+            )
+            if wandb_log and master_process:
+                wandb.config.update({'max_iters': max_iters}, allow_val_change=True)
+                wandb.run.summary['speedrun/estimated_max_iters'] = max_iters
+                wandb.run.summary['speedrun/average_update_seconds'] = speedrun_average_update_seconds
+                wandb.run.summary['speedrun/headroom_updates'] = speedrun_headroom_updates
+
+        # max_iters never terminates a speedrun. If later updates are faster than
+        # warmup predicted, keep at least one full update of schedule headroom so
+        # the timed run cannot reach the estimated horizon.
+        if speedrun_nominal_max_iters is not None and iter_num >= max_iters - 1:
+            extension = max(2, speedrun_headroom_updates)
+            max_iters = iter_num + extension
+            speedrun_horizon_extensions += 1
+            config['max_iters'] = max_iters
+            print(f"extending speedrun LR horizon to max_iters={max_iters}")
+            if wandb_log and master_process:
+                wandb.config.update({'max_iters': max_iters}, allow_val_change=True)
+                wandb.run.summary['speedrun/estimated_max_iters'] = max_iters
+                wandb.run.summary['speedrun/horizon_extensions'] = speedrun_horizon_extensions
+
+    # Determine and set the learning rate. The exceptional horizon-extension
+    # fallback is not allowed to increase LR after warmup.
     lr = get_lr(iter_num) if decay_lr else learning_rate
+    if (
+        decay_lr and speedrun_mode and speedrun_horizon_extensions > 0
+        and previous_scheduled_lr is not None
+    ):
+        lr = min(lr, previous_scheduled_lr)
+    previous_scheduled_lr = lr
     lr_scale = lr / learning_rate # schedule scale factor, applied to each group's base_lr
     for opt in optimizers:
         for param_group in opt.param_groups:
             param_group['lr'] = param_group['base_lr'] * lr_scale
 
-    # evaluate the loss on train/val sets
+    # evaluate the loss on train/val sets (master only; other ranks block at the
+    # next collective, same as ordinary mode; eval time counts against the limit)
     if (eval_only or iter_num % eval_interval == 0) and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
@@ -500,9 +727,14 @@ while iter_num < target_num_updates:
     if eval_only:
         break
 
+    # In speedrun mode, only materialize/log host metrics at log_interval to
+    # avoid a GPU synchronization on every update.
+    should_log = master_process and iter_num % log_interval == 0
+    collect_train_metrics = master_process and (not speedrun_mode or should_log)
+
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
-    loss_accum = torch.zeros((), device=device) if master_process else None
+    loss_accum = torch.zeros((), device=device) if collect_train_metrics else None
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
@@ -513,7 +745,7 @@ while iter_num < target_num_updates:
         with ctx:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        if master_process:
+        if collect_train_metrics:
             loss_accum += loss.detach()
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
@@ -534,18 +766,29 @@ while iter_num < target_num_updates:
     for opt in optimizers:
         opt.zero_grad(set_to_none=True)
 
+    # During the final minute, synchronize after every complete update so the
+    # wall-clock cutoff tracks finished GPU work rather than queued CUDA work.
+    if speedrun_mode:
+        speedrun_elapsed = time.monotonic() - speedrun_start_time
+        if speedrun_time_limit_seconds - speedrun_elapsed <= 60.0:
+            torch.cuda.synchronize()
+            speedrun_elapsed = time.monotonic() - speedrun_start_time
     # timing and logging
-    t1 = time.time()
+    t1 = time.perf_counter()
     dt = t1 - t0
     t0 = t1
-    # Convert the average accumulated loss to a CPU value for logging.
-    lossf = loss_accum.item() if master_process else None
-    if iter_num % log_interval == 0 and master_process:
+    # Convert metrics to host scalars only when this update is logged.
+    lossf = loss_accum.item() if collect_train_metrics else None
+    if should_log:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-    if wandb_log and master_process:
+        elapsed_text = f", elapsed {speedrun_elapsed:.1f}s" if speedrun_mode else ""
+        print(
+            f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, "
+            f"mfu {running_mfu*100:.2f}%{elapsed_text}"
+        )
+    if wandb_log and collect_train_metrics:
         wandb_metrics = {
             "train/lm_loss": lossf,
             "train/grad_norm": grad_norm.item(),
@@ -554,27 +797,99 @@ while iter_num < target_num_updates:
         }
         if optimizer_name == 'muon':
             wandb_metrics["lr/muon"] = optimizers[0].param_groups[0]['lr']
+        if raw_model.readout_backout_mix is not None:
+            readout_mix = raw_model.readout_backout_mix
+            wandb_metrics["residual/readout_backout/final"] = readout_mix[0].item()
+            wandb_metrics["residual/readout_backout/skip"] = readout_mix[1].item()
+        if speedrun_mode:
+            wandb_metrics.update({
+                "speedrun/elapsed_seconds": speedrun_elapsed,
+                "speedrun/remaining_seconds": max(
+                    speedrun_time_limit_seconds - speedrun_elapsed, 0.0
+                ),
+                "speedrun/updates_completed": iter_num + 1,
+                "speedrun/tokens_processed": (iter_num + 1) * tokens_per_iter,
+            })
         wandb.log(wandb_metrics, step=iter_num)
     iter_num += 1
     local_iter_num += 1
     did_train = True
 
-    # Saving after the update makes iter_num mean "number of completed
-    # updates". At multiples of save_interval this is numerically the same
-    # model state that the old code saved before the next indexed update.
-    if always_save_checkpoint and iter_num % save_interval == 0:
+    # Periodic checkpoints are intentionally disabled in speedrun mode. The
+    # exact final state is saved once after full validation.
+    if not speedrun_mode and always_save_checkpoint and iter_num % save_interval == 0:
         save_training_checkpoint()
 
-# final evaluation: full sequential pass over the entire validation set
+    if speedrun_mode and speedrun_should_stop(speedrun_elapsed):
+        speedrun_termination_reason = 'time_limit'
+        break
+
+# final evaluation: full sequential pass over the entire validation set. This
+# happens after the timed training region and does not count against the limit.
+speedrun_metadata = None
+if speedrun_mode:
+    torch.cuda.synchronize()
+    speedrun_elapsed = time.monotonic() - speedrun_start_time
+    speedrun_termination_reason = speedrun_termination_reason or 'time_limit'
+    if speedrun_nominal_max_iters is not None:
+        assert iter_num < max_iters, "speedrun reached its estimated max_iters horizon"
+    speedrun_metadata = {
+        'enabled': True,
+        'time_limit_seconds': speedrun_time_limit_seconds,
+        'training_elapsed_seconds': speedrun_elapsed,
+        'overshoot_seconds': max(speedrun_elapsed - speedrun_time_limit_seconds, 0.0),
+        'termination_reason': speedrun_termination_reason,
+        'completed_updates': iter_num,
+        'tokens_per_update': tokens_per_iter,
+        'tokens_processed': iter_num * tokens_per_iter,
+        'initial_max_iters': speedrun_initial_max_iters,
+        'nominal_estimated_max_iters': speedrun_nominal_max_iters,
+        'estimated_max_iters': max_iters if speedrun_nominal_max_iters is not None else None,
+        'headroom_updates': speedrun_headroom_updates,
+        'horizon_extensions': speedrun_horizon_extensions,
+        'warmup_average_update_seconds': speedrun_average_update_seconds,
+        'final_schedule_progress': (
+            iter_num / max_iters if speedrun_nominal_max_iters is not None else None
+        ),
+        'max_iters_not_reached': (
+            iter_num < max_iters if speedrun_nominal_max_iters is not None else None
+        ),
+        'lr_schedule_basis': (
+            'warmup_estimated_max_iters'
+            if speedrun_nominal_max_iters is not None else 'warmup_incomplete'
+        ),
+    }
+    print(
+        f"speedrun training stopped after {speedrun_elapsed:.2f}s, "
+        f"{iter_num} updates, {iter_num * tokens_per_iter:,} tokens; "
+        "starting full validation"
+    )
+
 if master_process:
     final_val_loss = estimate_val_full()
     print(f"final val loss (full pass over val.bin): {final_val_loss:.4f}")
+    if did_train or speedrun_mode:
+        # Save before remote logging so a W&B/network failure cannot lose the
+        # completed four-hour model.
+        save_training_checkpoint(
+            final_val_loss=final_val_loss,
+            speedrun_metadata=speedrun_metadata,
+        )
     if wandb_log:
-        wandb.log({"val/final_loss_full": final_val_loss}, step=iter_num)
+        final_metrics = {"val/final_loss_full": final_val_loss}
+        if speedrun_metadata is not None:
+            final_metrics.update({
+                "speedrun/final_updates": iter_num,
+                "speedrun/final_tokens": iter_num * tokens_per_iter,
+                "speedrun/training_elapsed_seconds": speedrun_elapsed,
+                "speedrun/overshoot_seconds": speedrun_metadata['overshoot_seconds'],
+            })
+        wandb.log(final_metrics, step=iter_num)
         wandb.run.summary["val/final_loss_full"] = final_val_loss
-    if did_train:
-        # Persist the exact model state whose final validation loss is reported.
-        save_training_checkpoint(final_val_loss=final_val_loss)
+        if speedrun_metadata is not None:
+            for key, value in speedrun_metadata.items():
+                if value is not None:
+                    wandb.run.summary[f"speedrun/{key}"] = value
 
 if ddp:
     destroy_process_group()
